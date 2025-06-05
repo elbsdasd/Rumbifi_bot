@@ -1,3 +1,5 @@
+# handlers/planning.py
+
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -11,60 +13,64 @@ from telegram.ext import (
 from datetime import datetime, date # Importar date
 
 import config
-from utils import database as db_utils # Interactúa con PostgreSQL
+from utils import database as db_utils
 from . import common_handlers
-# from .start_access import send_main_menu # Se usará a través de common_handlers.cancel_conversation...
+# La importación de start_access.send_main_menu_message se hará a través de common_handlers.cancel_conversation...
 
 logger = logging.getLogger(__name__)
 
-# Estados de la conversación (se mantienen)
+# Estados de la conversación para el flujo de AÑADIR ítems de planificación
 (
-    STATE_PLAN_ACTION_SELECT,
-    STATE_PLAN_GET_DESCRIPTION,
-    STATE_PLAN_GET_REMINDER_TIME,
-    STATE_PLAN_VIEW_DAILY_TASKS 
-) = range(4) 
+    STATE_PLAN_GET_TYPE_DESCRIPTION, # Esperando descripción después de elegir tipo
+    STATE_PLAN_GET_OBJECTIVE_REMINDER # Esperando hora de recordatorio SOLO para el objetivo
+) = range(30, 32) # Nuevo rango para evitar colisiones
 
-# Claves para context.user_data (se mantienen)
-UD_PLAN_CURRENT_TYPE = 'plan_current_type'
-UD_PLAN_TEMP_DESCRIPTION = 'plan_temp_description'
-UD_PLAN_TEMP_REMINDER_TIME = 'plan_temp_reminder_time'
-UD_PLAN_IMPORTANT_TASKS_COLLECTED = 'plan_important_tasks_collected'
-UD_PLAN_SECONDARY_TASKS_COLLECTED = 'plan_secondary_tasks_collected'
-UD_PLAN_CLEANUP_KEYS = [UD_PLAN_CURRENT_TYPE, UD_PLAN_TEMP_DESCRIPTION, UD_PLAN_TEMP_REMINDER_TIME,
-                        UD_PLAN_IMPORTANT_TASKS_COLLECTED, UD_PLAN_SECONDARY_TASKS_COLLECTED]
+# Estados para el flujo de VER Y MARCAR tareas
+(
+    STATE_PLAN_VIEW_MODE # Estado activo mientras se muestra la lista de tareas para marcar
+) = range(32, 33)
 
 
-# --- MENÚ PRINCIPAL DE PLANIFICACIÓN ---
+# Claves para context.user_data
+UD_PLAN_CURRENT_ITEM_TYPE = 'plan_current_item_type' # 'objective', 'important', 'secondary'
+UD_PLAN_TEMP_DESCRIPTION_LIST = 'plan_temp_description_list' # Lista de textos para imp/sec
+UD_PLAN_CLEANUP_KEYS_ADD_FLOW = [UD_PLAN_CURRENT_ITEM_TYPE, UD_PLAN_TEMP_DESCRIPTION_LIST]
+
+
+# --- MENÚ PRINCIPAL DE PLANIFICACIÓN (Entry point para handlers de esta sección) ---
 def planning_menu(update: Update, context: CallbackContext) -> int:
+    """
+    Muestra el menú de la sección 'Planificar Mi Día'.
+    Este es el entry point principal para los ConversationHandlers de planificación.
+    """
     query = update.callback_query
     user_id = query.from_user.id if query else update.effective_user.id
 
-
     has_access, access_message = db_utils.check_user_access(user_id)
     if not has_access:
+        # Esta función es un entry point a un ConversationHandler,
+        # si no hay acceso, no deberíamos entrar en la conversación.
+        # El handler de main.py que llama a esto es un CallbackQueryHandler simple.
+        # Así que podemos editar/enviar mensaje y NO retornar un estado de conversación.
         if query:
             query.answer()
             query.edit_message_text(text=access_message)
-        else: # Si se llama sin query (ej. después de cancelar una conversación)
+        else: # No debería ocurrir si se accede por botón
             context.bot.send_message(chat_id=user_id, text=access_message)
-        return ConversationHandler.END
+        return ConversationHandler.END # Terminar cualquier conversación potencial
 
     keyboard = [
-        [InlineKeyboardButton("🎯 Establecer Objetivo Principal", callback_data=config.CB_PLAN_SET_OBJECTIVE)],
-        [InlineKeyboardButton("⭐ Definir Tareas Importantes (hasta 3)", callback_data=config.CB_PLAN_SET_IMPORTANT)],
-        [InlineKeyboardButton("📝 Listar Tareas Secundarias", callback_data=config.CB_PLAN_SET_SECONDARY)],
-        [InlineKeyboardButton("📋 Ver Plan del Día y Marcar Avance", callback_data=config.CB_PLAN_VIEW_DAY)],
-        [common_handlers.get_main_menu_button()]
+        [InlineKeyboardButton("🎯 Objetivo Principal", callback_data=config.CB_PLAN_SET_OBJECTIVE)],
+        [InlineKeyboardButton("⭐ Tareas Importantes (hasta 3)", callback_data=config.CB_PLAN_SET_IMPORTANT)],
+        [InlineKeyboardButton("📝 Tareas Secundarias", callback_data=config.CB_PLAN_SET_SECONDARY)],
+        [InlineKeyboardButton("📋 Ver Plan del Día y Marcar", callback_data=config.CB_PLAN_VIEW_DAY)],
+        [common_handlers.get_back_to_main_menu_button()]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     message_text = (
         "🗓️ *Planificar Mi Día*\n\n"
-        "Te presento el método 1-3-5: cada día anota:\n"
-        "1️⃣ Objetivo Principal\n"
-        "3️⃣ Tareas Importantes\n"
-        "5️⃣ (o más) Tareas Secundarias\n\n"
+        "Método 1-3-5: 1 Objetivo, 3 Tareas Imp., 5+ Tareas Sec.\n"
         "Elige una opción:"
     )
     
@@ -74,171 +80,145 @@ def planning_menu(update: Update, context: CallbackContext) -> int:
     else: 
         context.bot.send_message(chat_id=user_id, text=message_text, reply_markup=reply_markup, parse_mode='Markdown')
         
-    return STATE_PLAN_ACTION_SELECT
+    return ConversationHandler. आगे # Placeholder, el estado real lo determinará el handler que lo use
 
 
-# --- INICIO DE FLUJO PARA REGISTRAR ITEMS ---
-def start_item_registration(update: Update, context: CallbackContext, item_type: str) -> int:
+# --- FLUJO: AÑADIR ITEMS DE PLANIFICACIÓN ---
+def start_add_item_flow(update: Update, context: CallbackContext, item_type: str) -> int:
+    """Inicia el flujo para añadir un tipo de ítem (objetivo, importante, secundario)."""
     query = update.callback_query
-    query.answer()
+    if query: query.answer()
     
-    context.user_data[UD_PLAN_CURRENT_TYPE] = item_type
-    context.user_data[UD_PLAN_TEMP_DESCRIPTION] = None # Reiniciar por si acaso
-    context.user_data[UD_PLAN_TEMP_REMINDER_TIME] = None # Reiniciar
+    context.user_data[UD_PLAN_CURRENT_ITEM_TYPE] = item_type
+    context.user_data[UD_PLAN_TEMP_DESCRIPTION_LIST] = [] # Para recolectar descripciones
 
-    # Limpiar listas de tareas recolectadas si se inicia un nuevo tipo
-    if UD_PLAN_IMPORTANT_TASKS_COLLECTED in context.user_data:
-        del context.user_data[UD_PLAN_IMPORTANT_TASKS_COLLECTED]
-    if UD_PLAN_SECONDARY_TASKS_COLLECTED in context.user_data:
-        del context.user_data[UD_PLAN_SECONDARY_TASKS_COLLECTED]
+    prompt_map = {
+        'objective': "🎯 Objetivo Principal del Día:\n\nEscribe tu objetivo. (/cancelplanning para salir)",
+        'important': "⭐ Tareas Importantes (máx. 3):\n\nEnvía la primera tarea. Puedes añadir hasta 3. Escribe /doneplanning al terminar, o /cancelplanning.",
+        'secondary': "📝 Tareas Secundarias:\n\nEnvía tu primera tarea secundaria. Puedes añadir varias. Escribe /doneplanning al terminar, o /cancelplanning."
+    }
+    prompt_text = prompt_map.get(item_type)
 
-
-    if item_type == 'important':
-        context.user_data[UD_PLAN_IMPORTANT_TASKS_COLLECTED] = []
-        prompt_text = "⭐ Tareas Importantes (máx. 3):\n\nEnvía la primera tarea importante del día. Puedes añadir hasta 3. Escribe /doneplanning cuando termines, o /cancelplanning para salir."
-    elif item_type == 'secondary':
-        context.user_data[UD_PLAN_SECONDARY_TASKS_COLLECTED] = []
-        prompt_text = "📝 Tareas Secundarias:\n\nEnvía tu primera tarea secundaria. Puedes añadir varias. Escribe /doneplanning cuando termines, o /cancelplanning para salir."
-    else: # objective
-        prompt_text = f"🎯 Objetivo Principal del Día:\n\nEscribe tu objetivo principal para hoy.\n\nEscribe /cancelplanning para salir."
-
-    query.edit_message_text(text=prompt_text)
-    return STATE_PLAN_GET_DESCRIPTION
-
-
-def plan_set_objective_cb(update: Update, context: CallbackContext) -> int:
-    return start_item_registration(update, context, 'objective')
-
-def plan_set_important_cb(update: Update, context: CallbackContext) -> int:
-    return start_item_registration(update, context, 'important')
-
-def plan_set_secondary_cb(update: Update, context: CallbackContext) -> int:
-    return start_item_registration(update, context, 'secondary')
-
-
-# --- OBTENER DESCRIPCIÓN DE LA TAREA ---
-def get_task_description(update: Update, context: CallbackContext) -> int:
-    user_text = update.message.text
-    item_type = context.user_data.get(UD_PLAN_CURRENT_TYPE)
-
-    if item_type == 'objective':
-        context.user_data[UD_PLAN_TEMP_DESCRIPTION] = user_text
-        update.message.reply_text(config.MSG_TIME_FORMAT_PROMPT)
-        return STATE_PLAN_GET_REMINDER_TIME
-    
-    elif item_type == 'important':
-        collected_tasks = context.user_data.get(UD_PLAN_IMPORTANT_TASKS_COLLECTED, [])
-        if len(collected_tasks) < 3:
-            collected_tasks.append({"text": user_text, "reminder_time": None}) 
-            context.user_data[UD_PLAN_IMPORTANT_TASKS_COLLECTED] = collected_tasks
-            if len(collected_tasks) < 3:
-                update.message.reply_text(f"✅ Tarea importante '{user_text[:30]}...' añadida ({len(collected_tasks)}/3). Envía la siguiente, o escribe /doneplanning.")
-                return STATE_PLAN_GET_DESCRIPTION 
-            else:
-                update.message.reply_text(f"✅ Has añadido 3 tareas importantes. Escribe /doneplanning para guardarlas.")
-                return STATE_PLAN_GET_DESCRIPTION 
-        else:
-            update.message.reply_text("Ya has añadido el máximo de 3 tareas importantes. Escribe /doneplanning para guardarlas.")
-            return STATE_PLAN_GET_DESCRIPTION
-
-    elif item_type == 'secondary':
-        collected_tasks = context.user_data.get(UD_PLAN_SECONDARY_TASKS_COLLECTED, [])
-        collected_tasks.append({"text": user_text, "reminder_time": None})
-        context.user_data[UD_PLAN_SECONDARY_TASKS_COLLECTED] = collected_tasks
-        update.message.reply_text(f"✅ Tarea secundaria '{user_text[:30]}...' añadida. Envía otra, o escribe /doneplanning.")
-        return STATE_PLAN_GET_DESCRIPTION
+    if query and query.message:
+        query.edit_message_text(text=prompt_text)
+    else: # Si no hay query o message (ej. reentrada a estado)
+        context.bot.send_message(chat_id=update.effective_chat.id, text=prompt_text)
         
-    # Fallback si item_type es desconocido (no debería pasar)
-    logger.error(f"Tipo de ítem desconocido en get_task_description: {item_type}")
-    return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS)
+    return STATE_PLAN_GET_TYPE_DESCRIPTION
 
+# Callbacks para los botones de añadir
+def cb_plan_set_objective(update: Update, context: CallbackContext) -> int:
+    return start_add_item_flow(update, context, 'objective')
+def cb_plan_set_important(update: Update, context: CallbackContext) -> int:
+    return start_add_item_flow(update, context, 'important')
+def cb_plan_set_secondary(update: Update, context: CallbackContext) -> int:
+    return start_add_item_flow(update, context, 'secondary')
 
-# --- OBTENER HORA DEL RECORDATORIO (Para Objetivo Principal) ---
-def get_reminder_time(update: Update, context: CallbackContext) -> int:
-    user_text = update.message.text.lower()
-    item_type = context.user_data.get(UD_PLAN_CURRENT_TYPE)
+def get_item_description_input(update: Update, context: CallbackContext) -> int:
+    """Recibe la descripción de la tarea/objetivo."""
+    user_text = update.message.text
+    item_type = context.user_data.get(UD_PLAN_CURRENT_ITEM_TYPE)
     
-    if item_type != 'objective': # Esta función es solo para el objetivo principal
-        logger.warning("get_reminder_time llamado incorrectamente para tipo no objetivo.")
-        return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS)
+    if item_type == 'objective':
+        # Para el objetivo, solo tomamos una descripción y luego pedimos recordatorio
+        context.user_data[UD_PLAN_TEMP_DESCRIPTION_LIST] = [user_text] # Guardar como lista de 1
+        update.message.reply_text(config.MSG_TIME_FORMAT_PROMPT)
+        return STATE_PLAN_GET_OBJECTIVE_REMINDER
+    
+    elif item_type in ['important', 'secondary']:
+        collected_list = context.user_data.get(UD_PLAN_TEMP_DESCRIPTION_LIST, [])
+        
+        if item_type == 'important' and len(collected_list) >= 3:
+            update.message.reply_text("Ya has añadido 3 tareas importantes. Escribe /doneplanning para guardarlas.")
+            return STATE_PLAN_GET_TYPE_DESCRIPTION # Seguir en este estado esperando /doneplanning
 
+        collected_list.append(user_text)
+        context.user_data[UD_PLAN_TEMP_DESCRIPTION_LIST] = collected_list
+        
+        count_msg = f"({len(collected_list)}/3)" if item_type == 'important' else ""
+        update.message.reply_text(f"✅ Tarea '{user_text[:30]}...' añadida {count_msg}. Envía otra, o /doneplanning para guardar.")
+        return STATE_PLAN_GET_TYPE_DESCRIPTION # Seguir esperando descripciones o /doneplanning
+        
+    logger.error(f"Tipo de ítem desconocido en get_item_description_input: {item_type}")
+    return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS_ADD_FLOW)
+
+def get_objective_reminder_input(update: Update, context: CallbackContext) -> int:
+    """Recibe la hora del recordatorio para el Objetivo Principal."""
+    user_text = update.message.text.lower()
+    item_type = context.user_data.get(UD_PLAN_CURRENT_ITEM_TYPE)
+    user_id = update.effective_user.id
+
+    if item_type != 'objective':
+        logger.warning("get_objective_reminder_input llamado para tipo no objetivo.")
+        return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS_ADD_FLOW)
+
+    reminder_time_to_save = None
     if user_text == 'no':
-        context.user_data[UD_PLAN_TEMP_REMINDER_TIME] = None
         update.message.reply_text("Entendido, sin recordatorio para el objetivo.")
     else:
         try:
             datetime.strptime(user_text, "%H:%M") # Validar formato
-            context.user_data[UD_PLAN_TEMP_REMINDER_TIME] = user_text
+            reminder_time_to_save = user_text
             update.message.reply_text(f"Recordatorio para el objetivo programado a las {user_text}.")
         except ValueError:
             update.message.reply_text(config.MSG_TIME_FORMAT_ERROR + "\nIntenta de nuevo o escribe 'no'.")
-            return STATE_PLAN_GET_REMINDER_TIME 
+            return STATE_PLAN_GET_OBJECTIVE_REMINDER 
 
-    description = context.user_data.get(UD_PLAN_TEMP_DESCRIPTION)
-    reminder = context.user_data.get(UD_PLAN_TEMP_REMINDER_TIME)
-    if description:
-        db_utils.save_planning_item( # Ahora interactúa con PostgreSQL
-            user_id=update.effective_user.id,
-            item_type='objective',
-            text=description,
-            reminder_time=reminder
+    description_list = context.user_data.get(UD_PLAN_TEMP_DESCRIPTION_LIST)
+    if description_list and description_list[0]:
+        db_utils.save_planning_item(
+            user_id=user_id, item_type='objective',
+            text=description_list[0], reminder_time=reminder_time_to_save
         )
         update.message.reply_text("🎯 ¡Objetivo principal guardado!")
     else:
         update.message.reply_text("⚠️ Hubo un error, no se encontró la descripción del objetivo.")
     
-    return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS)
+    return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS_ADD_FLOW)
 
-
-# --- FINALIZAR REGISTRO DE TAREAS (IMPORTANTES/SECUNDARIAS) ---
-def done_planning_tasks(update: Update, context: CallbackContext) -> int:
+def done_adding_planning_items(update: Update, context: CallbackContext) -> int:
+    """Comando /doneplanning: Guarda las tareas importantes o secundarias recolectadas."""
     user_id = update.effective_user.id
-    item_type = context.user_data.get(UD_PLAN_CURRENT_TYPE)
-    
-    tasks_to_save_data = []
-    if item_type == 'important':
-        tasks_to_save_data = context.user_data.get(UD_PLAN_IMPORTANT_TASKS_COLLECTED, [])
-    elif item_type == 'secondary':
-        tasks_to_save_data = context.user_data.get(UD_PLAN_SECONDARY_TASKS_COLLECTED, [])
+    item_type = context.user_data.get(UD_PLAN_CURRENT_ITEM_TYPE)
+    descriptions_list = context.user_data.get(UD_PLAN_TEMP_DESCRIPTION_LIST, [])
 
-    if not tasks_to_save_data:
-        update.message.reply_text("No has añadido ninguna tarea para guardar. Escribe /cancelplanning para volver.")
-        return STATE_PLAN_GET_DESCRIPTION # Quedarse en el estado de descripción
+    if not descriptions_list:
+        update.message.reply_text("No has añadido ninguna tarea. Escribe /cancelplanning para volver.")
+        return STATE_PLAN_GET_TYPE_DESCRIPTION 
     else:
         count = 0
-        for task_entry in tasks_to_save_data:
-            db_utils.save_planning_item(
-                user_id=user_id,
-                item_type=item_type,
-                text=task_entry["text"],
-                reminder_time=task_entry.get("reminder_time") # Por ahora, siempre None para estas
-            )
+        for desc_text in descriptions_list:
+            # Por ahora, las tareas importantes/secundarias se guardan sin recordatorio individual.
+            db_utils.save_planning_item(user_id=user_id, item_type=item_type, text=desc_text, reminder_time=None)
             count += 1
         update.message.reply_text(f"✅ ¡{count} tarea(s) '{item_type}' han sido guardadas!")
 
-    return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS)
+    return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS_ADD_FLOW)
 
+def cancel_add_planning_flow(update: Update, context: CallbackContext) -> int:
+    """Comando /cancelplanning para salir del flujo de añadir."""
+    return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS_ADD_FLOW)
 
-# --- VER Y MARCAR TAREAS DEL DÍA ---
-def view_daily_plan_cb(update: Update, context: CallbackContext) -> int: # Puede ser un estado o un callback simple
+# --- FLUJO: VER Y MARCAR TAREAS DEL DÍA ---
+def view_daily_plan_action_cb(update: Update, context: CallbackContext) -> int:
+    """Muestra el plan del día y permite marcar tareas."""
     query = update.callback_query
-    user_id = query.from_user.id if query else update.effective_user.id
-    
+    user_id = query.from_user.id
     if query: query.answer()
 
-    today_lima_date_obj = datetime.now(db_utils.LIMA_TZ).date() # Usar objeto date
-    items = db_utils.get_daily_planning_items(user_id, today_lima_date_obj) # Espera objeto date
+    today_lima_date_obj = datetime.now(db_utils.LIMA_TZ).date()
+    items_dictrows = db_utils.get_daily_planning_items(user_id, today_lima_date_obj)
 
     message_text = "📋 *Tu Plan para Hoy:* \n\n"
     keyboard_markup_rows = []
 
-    if not items:
-        message_text += "No tienes nada planeado para hoy. ¡Añade algunas tareas desde el menú de planificación!"
+    if not items_dictrows:
+        message_text += "No tienes nada planeado para hoy.\nPuedes añadir tareas desde el menú de planificación."
     else:
         item_categories = {"objective": "🎯 Objetivo:", "important": "⭐ Importantes:", "secondary": "📝 Secundarias:"}
         categorized_items = {"objective": [], "important": [], "secondary": []}
-        for item_dictrow in items: # item_dictrow es un DictRow de psycopg2
-            item = dict(item_dictrow) # Convertir a dict normal para acceso más fácil
+        for item_dr in items_dictrows:
+            item = dict(item_dr)
             if item.get("type") in categorized_items:
                 categorized_items[item.get("type")].append(item)
 
@@ -247,26 +227,22 @@ def view_daily_plan_cb(update: Update, context: CallbackContext) -> int: # Puede
                 message_text += f"*{category_title}*\n"
                 for item in categorized_items[category_key]:
                     status_emoji = "⏳" 
-                    if item.get("marked_at"): 
-                        status_emoji = "✅" if item.get("completed") else "❌"
+                    if item.get("completed") is True: status_emoji = "✅"
+                    elif item.get("completed") is False: status_emoji = "❌"
                     
                     reminder_str = ""
-                    if item.get("reminder_time"): # reminder_time es un objeto datetime.time
+                    if item.get("reminder_time"): # Es un objeto datetime.time
                         reminder_str = f" ({item['reminder_time'].strftime('%H:%M')})"
-
                     message_text += f"{status_emoji} {item['text']}{reminder_str}\n"
                     
-                    if item.get("completed") is None: # Solo mostrar botones si 'completed' es NULL (no marcado)
-                                                    # 'completed' es True, False, o None
-                        # La 'key' ahora es 'item_id' (entero) de la tabla planning_items
-                        item_id = item['key'] 
+                    if item.get("completed") is None: # Solo mostrar botones si aún no se ha marcado
+                        item_id = item['key'] # 'key' es el alias de item_id (entero)
                         cb_done = f"{config.CB_TASK_DONE_PREFIX}planning_{item_id}"
                         cb_not_done = f"{config.CB_TASK_NOT_DONE_PREFIX}planning_{item_id}"
-                        
-                        task_short_text = item['text'][:15] + ('...' if len(item['text']) > 15 else '')
+                        task_short = item['text'][:15] + ('…' if len(item['text']) > 15 else '')
                         buttons_row = [
-                            InlineKeyboardButton(f"✅ Hecho '{task_short_text}'", callback_data=cb_done),
-                            InlineKeyboardButton(f"❌ No '{task_short_text}'", callback_data=cb_not_done)
+                            InlineKeyboardButton(f"✅ Hecho '{task_short}'", callback_data=cb_done),
+                            InlineKeyboardButton(f"❌ No '{task_short}'", callback_data=cb_not_done)
                         ]
                         keyboard_markup_rows.append(buttons_row)
                 message_text += "\n"
@@ -274,156 +250,93 @@ def view_daily_plan_cb(update: Update, context: CallbackContext) -> int: # Puede
     keyboard_markup_rows.append([common_handlers.get_back_button(config.CB_PLAN_MAIN_MENU, "⬅️ Volver a Planificación")])
     reply_markup = InlineKeyboardMarkup(keyboard_markup_rows)
     
-    if query:
+    if query and query.message:
         try:
             query.edit_message_text(text=message_text, reply_markup=reply_markup, parse_mode='Markdown')
-        except Exception as e: # Si el mensaje es el mismo, puede fallar. Enviar nuevo.
-            logger.warning(f"Error editando vista de plan diario, enviando nuevo: {e}")
+        except Exception as e:
+            logger.warning(f"Error editando vista de plan diario (planning), enviando nuevo: {e}")
             context.bot.send_message(chat_id=user_id, text=message_text, reply_markup=reply_markup, parse_mode='Markdown')
-    else: # Llamado sin query
-        context.bot.send_message(chat_id=user_id, text=message_text, reply_markup=reply_markup, parse_mode='Markdown')
+    else: # No debería ocurrir si se accede por botón
+         context.bot.send_message(chat_id=user_id, text=message_text, reply_markup=reply_markup, parse_mode='Markdown')
         
-    return STATE_PLAN_VIEW_DAILY_TASKS # Mantenerse en este estado para los callbacks de marcado
+    return STATE_PLAN_VIEW_MODE
 
-
-def mark_task_cb(update: Update, context: CallbackContext) -> int:
+def mark_planning_task_cb(update: Update, context: CallbackContext) -> int:
+    """Callback para marcar una tarea de planificación como hecha o no hecha."""
     query = update.callback_query
     query.answer()
-
     callback_data = query.data
     try:
-        # Formato: CB_TASK_DONE_PREFIX + "planning_" + item_id (entero)
-        parts = callback_data.split('_') # task_done_planning_123
-        action_type = parts[0] + "_" + parts[1] # task_done o task_notdone
-        # db_name_part = parts[2] # "planning"
-        item_id = int(parts[3]) # El ID del ítem es un entero
-
-        completed_status = (action_type == config.CB_TASK_DONE_PREFIX[:-1]) # Comparar con "task_done"
-        
-        db_utils.update_planning_item_status(item_id, completed_status) # Usa item_id
-        
-        # query.message.reply_text(f"Tarea marcada como {'✅ completada' if completed_status else '❌ no completada'}.")
-        # No enviar mensaje nuevo, refrescar la lista directamente.
-        
-        # Para refrescar, volvemos a llamar la función que muestra la lista.
-        # Necesitamos pasar 'update' y 'context' correctamente.
-        # view_daily_plan_cb espera una query para editar, aquí tenemos una.
-        return view_daily_plan_cb(update, context)
-
+        parts = callback_data.split('_')
+        action_prefix_part = parts[0] + "_" + parts[1] # "task_done" o "task_notdone"
+        # section_part = parts[2] # "planning"
+        item_id = int(parts[3]) # El ID del ítem
+        completed_status = (action_prefix_part == config.CB_TASK_DONE_PREFIX[:-1]) # Compara con "task_done"
+        db_utils.update_planning_item_status(item_id, completed_status)
+        # Refrescar la vista
+        return view_daily_plan_action_cb(update, context)
     except (IndexError, ValueError) as e:
-        logger.error(f"Error parseando callback_data para marcar tarea: {e}, data: {callback_data}")
+        logger.error(f"Error parseando callback_data para marcar tarea de planning: {e}, data: {callback_data}")
         query.message.reply_text("⚠️ Error al procesar la acción.")
     except Exception as e:
-        logger.error(f"Error general marcando tarea: {e}, data: {callback_data}")
+        logger.error(f"Error general marcando tarea de planning: {e}, data: {callback_data}")
         query.message.reply_text("⚠️ Error inesperado al marcar la tarea.")
-        
-    return STATE_PLAN_VIEW_DAILY_TASKS # Quedarse en la vista o ir a un estado de error/menú
+    return STATE_PLAN_VIEW_MODE # Quedarse en la vista o ir a un estado de error/menú
+
+def back_to_planning_menu_from_view(update: Update, context: CallbackContext) -> int:
+    """Vuelve al menú de planificación desde la vista de tareas."""
+    # Esta función es llamada por un CallbackQueryHandler con pattern CB_PLAN_MAIN_MENU
+    # cuando se está en el estado STATE_PLAN_VIEW_MODE.
+    # Llama a planning_menu para reconstruir el menú.
+    return planning_menu(update, context)
 
 
-# --- CANCELACIÓN ---
-def cancel_planning_flow_command(update: Update, context: CallbackContext) -> int:
-    """Comando /cancelplanning para salir del flujo."""
-    return common_handlers.cancel_conversation_to_main_menu(update, context, UD_PLAN_CLEANUP_KEYS)
-
-# --- CONVERSATION HANDLER ---
-def get_planning_conversation_handler() -> ConversationHandler:
-    # Flujo para AÑADIR ítems (objetivo, importantes, secundarios)
-    add_item_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(plan_set_objective_cb, pattern=f"^{config.CB_PLAN_SET_OBJECTIVE}$"),
-            CallbackQueryHandler(plan_set_important_cb, pattern=f"^{config.CB_PLAN_SET_IMPORTANT}$"),
-            CallbackQueryHandler(plan_set_secondary_cb, pattern=f"^{config.CB_PLAN_SET_SECONDARY}$"),
-        ],
-        states={
-            STATE_PLAN_GET_DESCRIPTION: [
-                MessageHandler(Filters.text & ~Filters.command, get_task_description),
-                CommandHandler("doneplanning", done_planning_tasks),
-            ],
-            STATE_PLAN_GET_REMINDER_TIME: [ # Solo para el objetivo
-                MessageHandler(Filters.text & ~Filters.command, get_reminder_time)
-            ],
-        },
-        fallbacks=[ CommandHandler("cancelplanning", cancel_planning_flow_command) ],
-        map_to_parent={ ConversationHandler.END: STATE_PLAN_ACTION_SELECT } # Volver al menú de planificación
-    )
-
-    # Flujo para VER Y MARCAR tareas (es un estado simple que espera callbacks)
-    # Esto podría ser un ConversationHandler anidado o manejarse como estados de un handler más grande.
-    # Por simplicidad, hacemos un handler separado para ver/marcar que no es parte de la conversación de "añadir".
-    # No, view_daily_plan_cb es mejor como un callback que entra a un estado donde se esperan los botones de marcar.
-    # O, como está ahora, view_daily_plan_cb es un callback, y mark_task_cb es otro callback.
-    # Para que el refresco funcione, view_daily_plan_cb debe poder ser llamado por mark_task_cb.
-    
-    # Considerar que el menú de planificación (planning_menu) es el "estado" principal de esta sección.
-    # Los ConversationHandlers son para flujos específicos DENTRO de esta sección.
-    # Si usamos STATE_PLAN_ACTION_SELECT como "estado de reposo" del menú de planificación:
-    
-    main_planning_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(planning_menu, pattern=f"^{config.CB_PLAN_MAIN_MENU}$"), # Desde menú principal del bot
-            CallbackQueryHandler(view_daily_plan_cb, pattern=f"^{config.CB_PLAN_VIEW_DAY}$") 
-        ],
-        states={
-            STATE_PLAN_ACTION_SELECT: [ # Estado del menú de planificación
-                # Los entry_points del add_item_handler se activarán desde aquí
-                add_item_handler, # Anidar el ConversationHandler para añadir ítems
-                CallbackQueryHandler(view_daily_plan_cb, pattern=f"^{config.CB_PLAN_VIEW_DAY}$") 
-            ],
-            STATE_PLAN_VIEW_DAILY_TASKS: [ # Estado cuando se está viendo la lista de tareas
-                CallbackQueryHandler(mark_task_cb, pattern=f"^{config.CB_TASK_DONE_PREFIX}planning_"),
-                CallbackQueryHandler(mark_task_cb, pattern=f"^{config.CB_TASK_NOT_DONE_PREFIX}planning_"),
-                CallbackQueryHandler(planning_menu, pattern=f"^{config.CB_PLAN_MAIN_MENU}$") # Volver al menú de planif.
-            ]
-        },
-        fallbacks=[
-            CallbackQueryHandler(planning_menu, pattern=f"^{config.CB_PLAN_MAIN_MENU}$"), # Botón "Volver a Planificación"
-            CommandHandler("cancel", common_handlers.cancel_conversation_to_main_menu) # Un /cancel global
-        ],
-        # allow_reentry=True # Importante si se vuelve al mismo menú
-    )
-    # Esta estructura de ConversationHandler anidado o múltiple puede ser compleja.
-    # Simplificación: No usar un ConversationHandler global para la sección de planificación,
-    # sino ConversationHandlers para flujos específicos (como añadir tarea) y callbacks directos.
-    # La estructura actual en register_handlers es más simple:
-    # 1. Un ConvHandler para "añadir" (objetivo, imp, sec).
-    # 2. Callbacks directos para "ver" y "marcar".
-    # Esto es lo que se implementa en register_handlers.
-
-    return add_item_handler # Solo el handler para añadir tareas
-
-
+# --- REGISTRO DE HANDLERS ---
 def register_handlers(dp) -> None:
-    """Registra todos los handlers para la sección de planificación."""
-    # Handler para el flujo de añadir tareas (objetivo, importantes, secundarias)
-    dp.add_handler(get_planning_conversation_handler())
-    
-    # Handler para el botón "Ver Plan del Día" y los botones de marcar tareas
-    # (estos no necesitan ser parte de la misma conversación que "añadir tarea")
-    # O podrían ser un ConversationHandler separado si la vista de tareas se vuelve más interactiva.
-    # Por ahora, view_daily_plan_cb es un simple callback.
-    # Y mark_task_cb es un callback que refresca llamando a view_daily_plan_cb.
-    # Esto requiere que view_daily_plan_cb pueda manejar ser llamado después de un query.answer()
-    # y que pueda editar el mensaje de la query original.
-    
-    # Este ConversationHandler es para el estado de "ver y marcar tareas"
-    view_mark_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(view_daily_plan_cb, pattern=f"^{config.CB_PLAN_VIEW_DAY}$")],
+    # ConversationHandler para AÑADIR ítems (objetivo, importantes, secundarios)
+    add_item_conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(cb_plan_set_objective, pattern=f"^{config.CB_PLAN_SET_OBJECTIVE}$"),
+            CallbackQueryHandler(cb_plan_set_important, pattern=f"^{config.CB_PLAN_SET_IMPORTANT}$"),
+            CallbackQueryHandler(cb_plan_set_secondary, pattern=f"^{config.CB_PLAN_SET_SECONDARY}$"),
+        ],
         states={
-            STATE_PLAN_VIEW_DAILY_TASKS: [ # Esperando callbacks de marcar o volver
-                CallbackQueryHandler(mark_task_cb, pattern=f"^{config.CB_TASK_DONE_PREFIX}planning_"),
-                CallbackQueryHandler(mark_task_cb, pattern=f"^{config.CB_TASK_NOT_DONE_PREFIX}planning_"),
-                CallbackQueryHandler(planning_menu, pattern=f"^{config.CB_PLAN_MAIN_MENU}$"), # Volver al menú de planificación
+            STATE_PLAN_GET_TYPE_DESCRIPTION: [
+                MessageHandler(Filters.text & ~Filters.command, get_item_description_input),
+                CommandHandler("doneplanning", done_adding_planning_items),
+            ],
+            STATE_PLAN_GET_OBJECTIVE_REMINDER: [
+                MessageHandler(Filters.text & ~Filters.command, get_objective_reminder_input)
+            ],
+        },
+        fallbacks=[CommandHandler("cancelplanning", cancel_add_planning_flow)],
+        # Cuando este ConvHandler termina, queremos volver al menú de planificación.
+        # Esto se maneja llamando a common_handlers.cancel_conversation_to_main_menu,
+        # que a su vez llama a start_access.send_main_menu_message.
+        # O, idealmente, el estado de "reposo" del menú de planificación sería un estado del ConversationHandler principal.
+        # Por ahora, la cancelación lleva al menú principal del bot.
+        # Si queremos volver al menú de planificación:
+        map_to_parent={ConversationHandler.END: ConversationHandler.END} # O un estado específico si está anidado
+                                                                       # Si no está anidado, simplemente termina.
+                                                                       # La función de cancelación se encarga de mostrar el menú.
+    )
+    dp.add_handler(add_item_conv_handler)
+
+    # ConversationHandler para VER y MARCAR tareas
+    view_mark_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(view_daily_plan_action_cb, pattern=f"^{config.CB_PLAN_VIEW_DAY}$")],
+        states={
+            STATE_PLAN_VIEW_MODE: [
+                CallbackQueryHandler(mark_planning_task_cb, pattern=f"^{config.CB_TASK_DONE_PREFIX}planning_"),
+                CallbackQueryHandler(mark_planning_task_cb, pattern=f"^{config.CB_TASK_NOT_DONE_PREFIX}planning_"),
+                # Botón "Volver a Planificación" desde la vista de tareas:
+                CallbackQueryHandler(planning_menu, pattern=f"^{config.CB_PLAN_MAIN_MENU}$")
             ]
         },
-        fallbacks=[
-            CallbackQueryHandler(planning_menu, pattern=f"^{config.CB_PLAN_MAIN_MENU}$"),
-            CommandHandler("cancel", lambda u,c: common_handlers.cancel_conversation_to_main_menu(u,c, UD_PLAN_CLEANUP_KEYS))
-            ],
-        map_to_parent={ConversationHandler.END: -1} # -1 para que no afecte a otro handler si no es anidado
-                                                    # O un estado global si es anidado.
+        fallbacks=[CommandHandler("cancelplanning", cancel_add_planning_flow)], # Usar el mismo cancel
+        map_to_parent={ConversationHandler.END: ConversationHandler.END }
     )
-    dp.add_handler(view_mark_handler)
+    dp.add_handler(view_mark_conv_handler)
 
-    # El handler para el menú de planificación principal (CB_PLAN_MAIN_MENU)
-    # se registra en main.py, y llama a planning.planning_menu.
-    # planning_menu entonces se convierte en un entry point para los ConversationHandlers de arriba.
+    # El handler para el botón CB_PLAN_MAIN_MENU (que llama a planning.planning_menu)
+    # se registra en main.py y actúa como el entry point general para esta sección.

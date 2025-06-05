@@ -1,9 +1,15 @@
+# handlers/common_handlers.py
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import CallbackContext, ConversationHandler # Importar ConversationHandler
+from telegram.ext import CallbackContext, ConversationHandler
+
 import config
+# Import db_utils aquí si cancel_conversation_to_main_menu lo necesita directamente para check_user_access
+from utils import database as db_utils # Necesario para el check_user_access en la función de cancelar
 
 # --- TECLADOS COMUNES ---
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Devuelve el teclado del menú principal del bot."""
     keyboard = [
         [InlineKeyboardButton("🗓️ Planificar Mi Día", callback_data=config.CB_PLAN_MAIN_MENU)],
         [InlineKeyboardButton("💪 Bienestar Físico y Mental", callback_data=config.CB_WB_MAIN_MENU)],
@@ -12,74 +18,67 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_back_to_main_menu_button() -> InlineKeyboardButton:
-    return InlineKeyboardButton("⬅️ Volver al Menú Principal", callback_data=config.CB_MAIN_MENU)
+def get_back_to_main_menu_button(text: str = "⬅️ Volver al Menú Principal") -> InlineKeyboardButton:
+    """Devuelve un botón para volver al menú principal del bot."""
+    return InlineKeyboardButton(text, callback_data=config.CB_MAIN_MENU) # CB_MAIN_MENU es para el menú del bot
 
 def get_back_button(callback_data_target: str, text: str = "⬅️ Volver") -> InlineKeyboardButton:
+    """Devuelve un botón de 'Volver' genérico que apunta a un callback_data específico."""
     return InlineKeyboardButton(text, callback_data=callback_data_target)
 
 
 # --- FUNCIONES DE UTILIDAD PARA HANDLERS ---
 def cancel_conversation_to_main_menu(update: Update, context: CallbackContext, flow_specific_cleanup_keys: list = None) -> int:
     """
-    Función genérica para cancelar una conversación y volver al menú principal.
+    Función genérica para cancelar una conversación y volver al menú principal del bot.
     Limpia claves específicas del flujo en user_data.
     """
     user = update.effective_user
-    cancel_message = f"Operación cancelada, {user.first_name}. Volviendo al menú principal."
-
-    if update.message:
-        update.message.reply_text(cancel_message)
-    elif update.callback_query:
-        try:
-            update.callback_query.answer("Operación cancelada.")
-            # Es mejor enviar un nuevo mensaje para el menú que editar,
-            # ya que el mensaje original podría no ser adecuado para el menú.
-            # update.callback_query.edit_message_text(text=cancel_message) # Evitar esto
-        except Exception:
-            pass # No importa si falla el answer o edit
-
+    cancel_message_text = f"Operación cancelada, {user.first_name}."
+    
     # Limpiar datos de contexto específicos del flujo
     if flow_specific_cleanup_keys:
         for key in flow_specific_cleanup_keys:
             if key in context.user_data:
                 del context.user_data[key]
     
-    # También limpiar claves genéricas si existen
-    generic_keys_to_clear = ['current_flow_data', 'temp_messages']
-    for key in generic_keys_to_clear:
+    # Limpiar claves genéricas de conversación si existen
+    generic_conv_keys = ['current_flow_data', 'temp_messages', 
+                         'plan_current_type', 'plan_temp_description', 'plan_temp_reminder_time', 
+                         'plan_important_tasks_collected', 'plan_secondary_tasks_collected',
+                         'wb_current_type', 'wb_temp_items_collected',
+                         'fin_current_trans_type', 'fin_temp_amount']
+    for key in generic_conv_keys:
         if key in context.user_data:
             del context.user_data[key]
-            
-    # Enviar menú principal después de cancelar
-    # Necesitamos importar la función send_main_menu de start_access.py
-    # Esto puede crear una dependencia circular si no se maneja con cuidado.
-    # Una mejor práctica es que main.py maneje el envío del menú principal
-    # o que esta función devuelva un estado especial que main.py interprete.
-    # Por ahora, para simplificar, asumimos que se puede llamar a una función que envíe el menú.
-    # O que simplemente terminamos la conversación y el usuario usa /menu o /start.
 
-    # Para evitar la importación circular directa aquí, es mejor que el ConversationHandler
-    # que usa esta función, en su `fallbacks` o después de que esta función retorne END,
-    # llame a la función que muestra el menú principal.
-    # Por ahora, esta función solo se encarga de la limpieza y el mensaje de cancelación.
-    # El retorno de ConversationHandler.END es lo principal.
+    # Informar al usuario y enviar menú principal
+    if update.message: # Si se canceló por comando
+        update.message.reply_text(cancel_message_text)
+    elif update.callback_query: # Si se canceló por botón (aunque no hay uno genérico de cancelar con callback)
+        try:
+            update.callback_query.answer("Operación cancelada.")
+            # Enviar nuevo mensaje en lugar de editar para el menú
+        except Exception: pass # Ignorar si el answer falla
+
+    # Reutilizar la función send_main_menu de start_access para mostrar el menú
+    # Esto requiere una importación tardía o pasar la función como argumento para evitar circularidad.
+    # La mejor forma es que el ConversationHandler que usa esto simplemente termine (return ConversationHandler.END)
+    # y que el usuario use /menu o que un handler de nivel superior (si existe) tome el control.
+    # O, si esta función es el fallback de un ConvHandler, el ConvHandler puede tener un entry_point
+    # que sea el menú principal.
+
+    # Por ahora, enviaremos el menú desde aquí después de cancelar.
+    from .start_access import send_main_menu_message # Renombrar para claridad
     
-    # El handler que llama a esta función se encargará de redirigir al menú
-    # por ejemplo, haciendo que el ConversationHandler termine y el usuario
-    # vuelva a usar /menu, o el ConversationHandler padre tome el control.
-    
-    # Enviar menú principal como nuevo mensaje
-    from .start_access import send_main_menu # Importación tardía
-    # Verificar si el usuario tiene acceso antes de mostrar el menú
     has_access, _ = db_utils.check_user_access(user.id)
     if has_access:
-        send_main_menu(update, context, user_id=user.id, message_text="Operación cancelada. Aquí tienes el menú principal:")
+        send_main_menu_message(context, user.id, message_text="Operación cancelada. Aquí tienes el menú principal:")
     else:
-        # Si no tiene acceso, no mostrar menú, el check_user_access ya habrá enviado un mensaje.
-        # O enviar un mensaje genérico si es necesario.
-        if update.callback_query:
-             context.bot.send_message(chat_id=user.id, text="Operación cancelada.")
-        # El mensaje de no acceso ya se debería haber manejado por check_user_access.
-        
+        # Si no tiene acceso, el check_user_access ya habrá enviado un mensaje.
+        # O enviar un mensaje genérico de cancelación si es necesario.
+        if update.message is None and update.callback_query: # Si fue callback, pero no tiene acceso
+             context.bot.send_message(chat_id=user.id, text=cancel_message_text + " Acceso restringido.")
+        # (El mensaje de no acceso ya debería manejarse de forma centralizada por check_user_access)
+            
     return ConversationHandler.END
