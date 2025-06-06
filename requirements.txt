@@ -1,5 +1,5 @@
 python-telegram-bot==13.15
-psycopg2-binary>=2.9.0  # Para PostgreSQL
+psycopg2-binary>=2.9.0
 matplotlib>=3.5.0
-python-dotenv         # Para desarrollo local
-pytz                  # Para zonas horarias
+python-dotenv
+pytz
